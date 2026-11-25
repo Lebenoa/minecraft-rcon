@@ -12,32 +12,65 @@ const TYPE_RESPONSE: i32 = 0;
 const TYPE_COMMAND: i32 = 2;
 const TYPE_AUTH: i32 = 3;
 
-const AUTH_TIMEOUT: Duration = Duration::from_secs(2);
-const IDLE_TIMEOUT: Duration = Duration::from_millis(250);
+/// How long the client waits for the next packet before treating a response as
+/// complete. RCON has no end-of-response marker.
+const DEFAULT_IDLE_WINDOW: Duration = Duration::from_millis(250);
 const MAX_PACKET: usize = 64 * 1024;
 
 /// A logged-in RCON connection.
 pub struct RconClient {
     stream: TcpStream,
     request_id: i32,
+    idle_window: Duration,
 }
 
 impl RconClient {
-    /// Opens a connection and authenticates it.
+    /// Opens a connection and authenticates it, without a timeout.
     pub async fn connect(addr: &str, password: &str) -> Result<RconClient> {
-        let mut stream = timeout(AUTH_TIMEOUT, TcpStream::connect(addr))
+        let mut stream = TcpStream::connect(addr)
             .await
-            .map_err(|_| anyhow!("connecting to {addr} timed out"))?
             .with_context(|| format!("connecting to {addr}"))?;
 
         let mut request_id = 0;
         login(&mut stream, &mut request_id, password).await?;
-        Ok(RconClient { stream, request_id })
+        Ok(RconClient {
+            stream,
+            request_id,
+            idle_window: DEFAULT_IDLE_WINDOW,
+        })
     }
 
-    /// Runs one command and returns its output.
+    /// Opens a connection and authenticates it within `timeout`.
+    pub async fn connect_with_timeout(
+        addr: &str,
+        password: &str,
+        timeout: Duration,
+    ) -> Result<RconClient> {
+        tokio::time::timeout(timeout, Self::connect(addr, password))
+            .await
+            .map_err(|_| anyhow!("connecting to {addr} timed out after {timeout:?}"))?
+    }
+
+    /// Runs one command and returns its output, without a timeout.
     pub async fn cmd(&mut self, command: &str) -> Result<String> {
-        command_on(&mut self.stream, &mut self.request_id, command).await
+        command_on(&mut self.stream, &mut self.request_id, command, self.idle_window).await
+    }
+
+    /// Runs one command and returns its output, failing if it takes longer
+    /// than `timeout`.
+    ///
+    /// A timeout leaves any late reply unread on the connection; discard the
+    /// client rather than reuse it after a timeout.
+    pub async fn cmd_with_timeout(&mut self, command: &str, timeout: Duration) -> Result<String> {
+        tokio::time::timeout(timeout, self.cmd(command))
+            .await
+            .map_err(|_| anyhow!("command timed out after {timeout:?}"))?
+    }
+
+    /// Sets how long the client waits for the next packet before treating a
+    /// response as complete. Defaults to 250 ms.
+    pub fn set_idle_window(&mut self, idle_window: Duration) {
+        self.idle_window = idle_window;
     }
 }
 
@@ -48,9 +81,8 @@ where
     send_packet(stream, request_id, TYPE_AUTH, password.as_bytes()).await?;
     let expected = *request_id;
 
-    let (id, _, _) = timeout(AUTH_TIMEOUT, read_packet(stream))
+    let (id, _, _) = read_packet(stream)
         .await
-        .map_err(|_| anyhow!("RCON authentication timed out"))?
         .context("reading RCON auth response")?;
 
     if id == -1 || id != expected {
@@ -59,7 +91,12 @@ where
     Ok(())
 }
 
-async fn command_on<S>(stream: &mut S, request_id: &mut i32, command: &str) -> Result<String>
+async fn command_on<S>(
+    stream: &mut S,
+    request_id: &mut i32,
+    command: &str,
+    idle_window: Duration,
+) -> Result<String>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -68,7 +105,7 @@ where
 
     let mut output = Vec::new();
     loop {
-        match timeout(IDLE_TIMEOUT, read_packet(stream)).await {
+        match timeout(idle_window, read_packet(stream)).await {
             Ok(Ok((id, kind, body))) => {
                 if id != expected {
                     bail!("mismatched response id (expected {expected}, got {id})");
@@ -156,7 +193,9 @@ mod tests {
 
         let mut id = 0;
         login(&mut client, &mut id, "secret").await.unwrap();
-        let output = command_on(&mut client, &mut id, "list").await.unwrap();
+        let output = command_on(&mut client, &mut id, "list", DEFAULT_IDLE_WINDOW)
+            .await
+            .unwrap();
         assert_eq!(output, "2 of 20 players online");
     }
 
@@ -197,7 +236,29 @@ mod tests {
 
         let mut id = 0;
         login(&mut client, &mut id, "secret").await.unwrap();
-        let output = command_on(&mut client, &mut id, "list").await.unwrap();
+        let output = command_on(&mut client, &mut id, "list", DEFAULT_IDLE_WINDOW)
+            .await
+            .unwrap();
         assert_eq!(output, "2 of 20 players online");
+    }
+
+    #[tokio::test]
+    async fn cmd_times_out_when_the_server_never_answers() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        tokio::spawn(async move {
+            let (id, _, _) = read_packet(&mut server).await.unwrap();
+            write_packet(&mut server, id, TYPE_RESPONSE, b"").await.unwrap();
+            let _ = read_packet(&mut server).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let mut id = 0;
+        login(&mut client, &mut id, "secret").await.unwrap();
+        let result = timeout(
+            Duration::from_millis(30),
+            command_on(&mut client, &mut id, "list", DEFAULT_IDLE_WINDOW),
+        )
+        .await;
+        assert!(result.is_err(), "expected a timeout");
     }
 }
