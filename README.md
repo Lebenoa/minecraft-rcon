@@ -34,16 +34,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 There are 2 of a max of 20 players online: Steve, Alex
 ```
 
-`connect` logs in and fails with `RCON authentication failed` when the password is wrong. `cmd` returns the command's output with the trailing newline trimmed.
+`connect` logs in and fails with `RCON authentication failed` when the password is wrong. `cmd` returns the command's output with the trailing newline trimmed. Neither has a built-in deadline; call `connect_with_timeout` / `cmd_with_timeout` when you need one.
 
 ## API reference
 
 | Item | Signature | Behavior |
 |---|---|---|
-| `RconClient::connect` | `async fn connect(addr: &str, password: &str) -> anyhow::Result<RconClient>` | Opens `addr` (`host:port`), authenticates; 2 s timeout for the TCP connect and for the auth reply |
-| `RconClient::cmd` | `async fn cmd(&mut self, command: &str) -> anyhow::Result<String>` | Sends one command; collects replies until 250 ms of silence or 64 KiB of output |
+| `RconClient::connect` | `async fn connect(addr: &str, password: &str) -> anyhow::Result<RconClient>` | Opens `addr` (`host:port`) and authenticates; waits as long as the server takes |
+| `RconClient::connect_with_timeout` | `async fn connect_with_timeout(addr: &str, password: &str, timeout: Duration) -> anyhow::Result<RconClient>` | Same, failing once `timeout` elapses while connecting or authenticating |
+| `RconClient::cmd` | `async fn cmd(&mut self, command: &str) -> anyhow::Result<String>` | Sends one command; collects replies until the idle window passes or 64 KiB arrive |
+| `RconClient::cmd_with_timeout` | `async fn cmd_with_timeout(&mut self, command: &str, timeout: Duration) -> anyhow::Result<String>` | Same, failing once `timeout` elapses; discard the client after a timeout |
+| `RconClient::set_idle_window` | `fn set_idle_window(&mut self, idle_window: Duration)` | Sets the gap between packets that ends a response; 250 ms by default |
 
-Both return `anyhow::Error` with context (`connecting to …`, `reading RCON auth response`, `sending RCON packet`). The client owns one connection; commands are serialized by `&mut self`.
+All return `anyhow::Error` with context (`connecting to …`, `reading RCON auth response`, `sending RCON packet`). The client owns one connection; commands are serialized by `&mut self`.
 
 ## Examples
 
@@ -77,7 +80,8 @@ for _ in 0..3 {
 ## Limitations
 
 - RCON has no encryption: the password and every command travel as plaintext. Keep the port on loopback or a VPN.
-- One command per `cmd` call. Output is collected until 250 ms pass without a new packet, so a slow server can add that delay and a very long response can be cut at 64 KiB.
+- One command per `cmd` call. Output is collected until the idle window (250 ms by default, see `set_idle_window`) passes without a new packet, so a slow server can add that delay and a very long response can be cut at 64 KiB.
+- No built-in deadline: a server that accepts the connection and never answers blocks `connect`/`cmd` until you cancel the future or use the `_with_timeout` variants.
 - No automatic reconnect: a dropped connection surfaces as an error on the next call; reconnect by calling `connect` again.
 - The client does not retry, throttle, or check command syntax; the server validates commands and returns its error text as output.
 
