@@ -13,7 +13,7 @@ cargo add tokio --features macros,rt-multi-thread
 Pin a rev for reproducible builds:
 
 ```bash
-cargo add minecraft-rcon --git https://github.com/Lebenoa/minecraft-rcon --rev f19a2090f246438447adbfd35d343ea5c76fdf24
+cargo add minecraft-rcon --git https://github.com/Lebenoa/minecraft-rcon --rev 00f89fbd5ba167e30f8d9b3906120b4d9b647d57
 ```
 
 ## Quick start
